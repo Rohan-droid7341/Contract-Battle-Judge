@@ -10,62 +10,40 @@ app.use(express.urlencoded({ extended: true }));
 // Set up the internal workspace path
 const WORKSPACE_DIR = '/app/evaluate';
 
-// Level 2 Code Payload
-let LEVEL2_PAYLOAD = `// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
-contract Level2 {
-    mapping(address => uint256) public balances;
-    function deposit() external payable { balances[msg.sender] += msg.value; }
-    function withdraw(uint256 amount) external {
-        require(balances[msg.sender] >= amount, "Insufficient Balance");
-        balances[msg.sender] -= amount;
-        (bool success, ) = msg.sender.call{value: amount}("");
-        require(success, "Transfer Failed");
-    }
-}`;
-
-try {
-    LEVEL2_PAYLOAD = fs.readFileSync(path.join(__dirname, 'Level2.sol'), 'utf8');
-} catch (e) {
-    // fallback to default above
-}
-
-// The secret test URL is fetched directly during evaluation to ensure it's always up-to-date
-const SECRET_TEST_URL = process.env.LEVEL_1_SECRET_URL;
-if (!SECRET_TEST_URL) {
-    console.warn("WARNING: LEVEL_1_SECRET_URL not set! Tests might fail if not mounted.");
-}
-
 app.post('/submit', async (req, res) => {
-    const { username, code, repoOwner, repoName } = req.body;
+    const { username, code, repoOwner, repoName, level: reqLevel } = req.body;
+    let level = parseInt(reqLevel) || 1;
     
     if (!username || !code) {
         return res.status(400).send("STATUS=FAILURE\nMESSAGE=Missing username or code");
     }
 
     // Write the player's code to the internal foundry source folder
-    const playerCodePath = path.join(WORKSPACE_DIR, 'src', 'Level1.sol');
+    const playerCodePath = path.join(WORKSPACE_DIR, 'src', `Level${level}.sol`);
     fs.writeFileSync(playerCodePath, code);
 
-    console.log(`Evaluating submission from Pilot: ${username} ...`);
+    console.log(`Evaluating Level ${level} submission from Pilot: ${username} ...`);
 
     try {
-        if (SECRET_TEST_URL) {
-            execSync(`curl -sL "${SECRET_TEST_URL}" > ${WORKSPACE_DIR}/test/Level1Secret.t.sol`);
+        const secretTestFile = path.join(__dirname, 'levels_vault', `Level${level}`, `Level${level}_secret.t.sol`);
+        if (!fs.existsSync(secretTestFile)) {
+             throw new Error(`Mission Level ${level} is currently classified. Tests not found.`);
         }
+        
+        fs.copyFileSync(secretTestFile, path.join(WORKSPACE_DIR, 'test', `Level${level}_secret.t.sol`));
 
         // Run forge test explicitly pointing to the downloaded secret test
-        const output = execSync('forge test --match-path "test/Level1Secret.t.sol" -vv', {
+        const output = execSync(`forge test --match-path "test/Level${level}_secret.t.sol" -vv`, {
             cwd: WORKSPACE_DIR,
             encoding: 'utf-8',
             stdio: 'pipe'
         });
         
         if (output.includes("No tests found to run") || output.includes("Ran 0 test suites")) {
-             throw new Error("Central Judge Misconfiguration: Secret tests didn't run. Please verify your Render environment variables.");
+             throw new Error("Central Judge Misconfiguration: Secret tests didn't run. Please verify vault paths.");
         }
         
-        console.log(`[PASS] ${username} successfully cleared Level 1!`);
+        console.log(`[PASS] ${username} successfully cleared Level ${level}!`);
 
         // Update Github if token and repo is provided (Leaderboard & Drop file push)
         const GITHUB_TOKEN = process.env.MASTER_PAT;
@@ -96,20 +74,20 @@ app.post('/submit', async (req, res) => {
                                  let cols = r.split('|').filter(c => c.trim() !== '');
                                  if (cols.length >= 4) {
                                      let pilot = cols[1].trim();
-                                     let level = parseInt(cols[2].trim()) || 1;
+                                     let highestLevel = parseInt(cols[2].trim()) || 1;
                                      let timeStr = cols[3].trim();
                                      if (pilot === username) {
                                          playerFound = true;
-                                         level = 1;
-                                         timeStr = new Date().toISOString();
+                                         highestLevel = Math.max(highestLevel, level);
+                                         timeStr = new Date().toISOString().replace('T', ' ').substring(0, 19);
                                      }
-                                     return { pilot, level, timeStr };
+                                     return { pilot, level: highestLevel, timeStr };
                                  }
                                  return null;
                              }).filter(r => r !== null);
                              
                              if (!playerFound) {
-                                 parsedRows.push({ pilot: username, level: 1, timeStr: new Date().toISOString().replace('T', ' ').substring(0, 19) });
+                                 parsedRows.push({ pilot: username, level: level, timeStr: new Date().toISOString().replace('T', ' ').substring(0, 19) });
                              }
                              
                              // Sort descending by level, then ascending by time
@@ -130,7 +108,7 @@ app.post('/submit', async (req, res) => {
                                          'Content-Type': 'application/json'
                                      },
                                      body: JSON.stringify({
-                                         message: `🏆 Update leaderboard for ${username}`,
+                                         message: `🏆 Update leaderboard for ${username} (Level ${level})`,
                                          content: Buffer.from(newReadmeContent).toString('base64'),
                                          sha: readmeData.sha
                                      })
@@ -147,13 +125,29 @@ app.post('/submit', async (req, res) => {
              }
         }
         
-        // Return simple text directly
-        return res.status(200).send(`STATUS=SUCCESS\nMESSAGE=ACCESS GRANTED! You have passed the hidden evaluation.\nLEVEL2=${Buffer.from(LEVEL2_PAYLOAD).toString('base64')}`);
+        // Build dynamic payload response securely without Gists
+        let responsePayload = `STATUS=SUCCESS\nMESSAGE=ACCESS GRANTED! You have passed the hidden evaluation.\n`;
+        const nextLevel = level + 1;
+        const nextLevelDir = path.join(__dirname, 'levels_vault', `Level${nextLevel}`);
+        
+        if (fs.existsSync(nextLevelDir)) {
+             if (fs.existsSync(path.join(nextLevelDir, `Level${nextLevel}.sol`))) {
+                 responsePayload += `FILE_src@Level${nextLevel}.sol=${fs.readFileSync(path.join(nextLevelDir, `Level${nextLevel}.sol`)).toString('base64')}\n`;
+             }
+             if (fs.existsSync(path.join(nextLevelDir, `Level${nextLevel}_local.t.sol`))) {
+                 responsePayload += `FILE_test@Level${nextLevel}.t.sol=${fs.readFileSync(path.join(nextLevelDir, `Level${nextLevel}_local.t.sol`)).toString('base64')}\n`;
+             }
+             if (fs.existsSync(path.join(nextLevelDir, 'instructions.md'))) {
+                 responsePayload += `FILE_instructions@Level${nextLevel}.md=${fs.readFileSync(path.join(nextLevelDir, 'instructions.md')).toString('base64')}\n`;
+             }
+        }
+        
+        return res.status(200).send(responsePayload);
 
     } catch (error) {
         console.log(`[FAIL] ${username} failed the secret tests.`);
         console.log(error.stdout || error.message);
-        return res.status(400).send("STATUS=FAILURE\nMESSAGE=ACCESS DENIED: Your submission failed the secret tests!");
+        return res.status(400).send(`STATUS=FAILURE\nMESSAGE=${error.message.replace(/\n/g, ' ')}\n`);
     }
 });
 
